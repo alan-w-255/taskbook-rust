@@ -1,12 +1,13 @@
+use clap::{App, Arg};
+use rusqlite::{Row, params, Connection, NO_PARAMS, Result as SQL_Result, MappedRows};
+use rusqlite::types::{FromSql, FromSqlResult, ValueRef};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::collections::HashMap;
 use std::fs::File;
-use std::path::Path;
-use clap::{Arg, App};
 use std::io::BufWriter;
+use std::path::Path;
 
-const CONFIGURATION_FILE:&str = "taskbook-rust.json";
+const CONFIGURATION_FILE: &str = "taskbook-rust.json";
 
 fn main() {
     let mut taskbook = TaskBook::new();
@@ -16,26 +17,32 @@ fn main() {
         .version("1.0.0")
         .author("alan wong heywym@qq.com")
         .about("manage tasks in termial")
-        .arg(Arg::with_name("new task")
-            .short("n")
-            .long("new")
-            .value_name("task")
-            .help("create new task")
-            .takes_value(true))
-        .arg(Arg::with_name("check")
-            .short("c")
-            .long("check")
-            .value_name("task_ids")
-            .help("mark task as checked")
-            .takes_value(true)
-            .multiple(true))
-        .arg(Arg::with_name("uncheck")
-            .short("u")
-            .long("uncheck")
-            .help("set task as uncheck")
-            .value_name("task_ids")
-            .takes_value(true)
-            .multiple(true))
+        .arg(
+            Arg::with_name("new task")
+                .short("n")
+                .long("new")
+                .value_name("task")
+                .help("create new task")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("check")
+                .short("c")
+                .long("check")
+                .value_name("task_ids")
+                .help("mark task as checked")
+                .takes_value(true)
+                .multiple(true),
+        )
+        .arg(
+            Arg::with_name("uncheck")
+                .short("u")
+                .long("uncheck")
+                .help("set task as uncheck")
+                .value_name("task_ids")
+                .takes_value(true)
+                .multiple(true),
+        )
         .before_help("show tasks")
         .get_matches();
 
@@ -45,13 +52,13 @@ fn main() {
         return;
     }
     if let Some(task_ids) = matches.values_of("check") {
-        let ids: Vec<u32> = task_ids.map( |x| x.parse().unwrap()).collect();
+        let ids: Vec<u32> = task_ids.map(|x| x.parse().unwrap()).collect();
         taskbook.set_task_state(ids, TaskState::DONE);
         taskbook.save_data();
         return;
     }
     if let Some(task_ids) = matches.values_of("uncheck") {
-        let ids: Vec<u32> = task_ids.map( |x| x.parse().unwrap()).collect();
+        let ids: Vec<u32> = task_ids.map(|x| x.parse().unwrap()).collect();
         taskbook.set_task_state(ids, TaskState::DOING);
         taskbook.save_data();
         return;
@@ -61,16 +68,15 @@ fn main() {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 struct TaskBook {
-    tasks: HashMap<u32, Task>,
+    db_conn: Option<Connection>,
     next_id: u32,
 }
 
 impl TaskBook {
     fn new() -> TaskBook {
         TaskBook {
-            tasks: HashMap::new(),
+            db_conn: None,
             next_id: 0,
         }
     }
@@ -81,49 +87,45 @@ impl TaskBook {
         self.next_id += 1;
     }
 
-    fn set_task_state(&mut self, ids: Vec<u32>, state:TaskState) {
+    fn set_task_state(&mut self, ids: Vec<u32>, state: TaskState) {
         for id in ids {
             self.tasks.entry(id).and_modify(|x| x.set_state(state));
         }
     }
 
-    fn load_data(&mut self) {
-        let path = Path::new(CONFIGURATION_FILE);
-        if path.is_file() {
-            let file = match File::open(&path) {
-                Err(why) => panic!("couldn't open {}: {}", path.display(), why.description()),
-                Ok(file) => file,
-            };
-            let taskbook: TaskBook = match serde_json::from_reader(file) {
-                Err(why) => panic!("can't read data from file: {}", why.description()),
-                Ok(tb) => tb,
-            };
-            self.tasks = taskbook.tasks;
-            self.next_id = taskbook.next_id;
-            return;
+    fn init_db(&mut self) -> SQL_Result<()> {
+        let db_path = Path::new(CONFIGURATION_FILE);
+        let conn = Connection::open(db_path)?;
+
+        conn.execute(
+            "CREATE TABLE task (
+            id integer primary key,
+            content TEXT NOT NULL,
+            state TEXT NOT NULL)",
+            NO_PARAMS)?;
+        self.db_conn = Some(conn);
+        Ok(())
+    }
+
+    fn find_all_task<F>(&self) ->Result<MappedRows<F>, &str> 
+        where F: FnMut(&Row<'_>) -> Result<Task, &'static str>
+    {
+        if let None = self.db_conn {
+            return Err("fail to connect to db");
         }
-        let file = match File::create(path) {
-            Err(why) => panic!("couldn't create {}: {}", path.display(), why.description()),
-            Ok(file) => file,
-        };
-        let writer = BufWriter::new(file);
-        match serde_json::to_writer(writer, self) {
-            Err(why) => panic!("fail to save json data {}", why.description()),
-            _ => (),
-        }
+        let conn = self.db_conn.unwrap();
+        let mut stmt = conn.prepare("SELECT id, content, state FROM task").unwrap();
+        let task_iter = stmt.query_map(params![], |row| {
+                    Ok(Task{ 
+                        id: row.get(0).unwrap(),
+                        content: row.get(1).unwrap(),
+                        state: row.get(2).unwrap(),
+                    })
+                }).unwrap();
+        Ok(task_iter)
     }
 
     fn save_data(&self) {
-        let path = Path::new(CONFIGURATION_FILE);
-        let file = match File::create(path) {
-            Err(why) => panic!("couldn't save file {}: {}", path.display(), why.description()),
-            Ok(file) => file,
-        };
-        let writer = BufWriter::new(file);
-        match serde_json::to_writer(writer, self) {
-            Err(why) => panic!("fail to save json data {}", why.description()),
-            _ => (),
-        }
     }
 }
 
@@ -142,7 +144,6 @@ impl Task {
             state: TaskState::DOING,
         }
     }
-    
     fn set_state(&mut self, state: TaskState) {
         self.state = state;
     }
@@ -153,4 +154,16 @@ enum TaskState {
     DONE,
     DOING,
     DEAD,
+}
+
+impl FromSql for TaskState {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        String::column_result(value).map(|v| {
+            match &*v {
+                "DOING" => TaskState::DOING,
+                "DONE" => TaskState::DONE,
+                "DEAD" => TaskState::DEAD,
+            }
+        })
+    }
 }
